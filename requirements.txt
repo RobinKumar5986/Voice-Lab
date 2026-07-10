@@ -1,0 +1,28 @@
+# Character Voice Studio - dependencies
+# Install with: pip install -r requirements.txt
+#
+# System dependency (not pip-installable): espeak-ng
+#   sudo apt-get install -y espeak-ng
+#
+# PyTorch is pinned to the CUDA 12.1 build for the GTX 1650 setup.
+# If installing fresh, use:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# then:
+#   pip install -r requirements.txt
+
+# --- TTS engine ---
+kokoro>=0.9.4
+misaki[en]
+
+# Optional, only needed if you use the Japanese or Mandarin voices in the UI:
+# misaki[ja]   (Japanese - also run `python -m unidic download` once, ~1GB)
+# misaki[zh]   (Mandarin Chinese)
+
+# --- Audio I/O ---
+soundfile
+pygame
+
+# --- UI ---
+customtkinter
+
+# --- Add future packages below, grouped by purpose ---
