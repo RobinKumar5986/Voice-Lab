@@ -1,5 +1,5 @@
 """
-Character Voice Studio - Kokoro TTS desktop UI
+Character Voice Studio - Kokoro TTS desktop UI (+ optional Chatterbox emotion tags)
 
 Features:
 1. Character (voice) selector with preview playback.
@@ -9,22 +9,36 @@ Features:
 2. Large text box to paste text for generation.
 3. Generate button that renders the pasted text using the selected
    voice and saves the output to ./output/<timestamp>_<voice>.wav
+4. Emotion tag toggles ([laugh], [sigh], [cough], etc.) - ON by default.
+   If your text contains an enabled tag, that line is routed to
+   Chatterbox-Turbo (real trained emotion) instead of Kokoro. Disabled
+   tags are silently stripped from the text before generating.
+5. Help button explaining all of the above with example prompts.
 
 Run:
-    source ~/kokoro-env/bin/activate
-    pip install customtkinter pygame
+    source ./kokoro-env/bin/activate
     python3 character_voice_studio.py
 """
 
 import os
+import re
+import subprocess
+import tempfile
 import threading
 from datetime import datetime
+
+import numpy as np
 
 import customtkinter as ctk
 import torch
 import soundfile as sf
 import pygame
 from kokoro import KPipeline
+
+
+from scipy.signal import resample_poly
+from math import gcd
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -34,6 +48,27 @@ CHARACTER_SPEECH_DIR = "characterSpeech"
 OUTPUT_DIR = "output"
 LAST_TEXT_FILE = "last_text.txt"
 SAMPLE_RATE = 24000
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REFERENCE_DIR = os.path.join(CHARACTER_SPEECH_DIR, "references")
+CHATTERBOX_ENV_PYTHON = os.path.join(SCRIPT_DIR, "chatterbox-env", "bin", "python3")
+CHATTERBOX_WORKER_SCRIPT = os.path.join(SCRIPT_DIR, "chatterbox_worker.py")
+
+# Official Chatterbox-Turbo paralinguistic tags (confirmed by Resemble AI staff).
+# Note: these are documented as inconsistent/hit-or-miss, not a bug here.
+EMOTION_TAGS = [
+    "laugh", "chuckle", "cough", "sigh",
+    "clear throat", "shush", "groan", "sniff", "gasp",
+]
+
+# Longer sample text used ONLY to build a Chatterbox reference clip per voice
+# (Chatterbox requires 5+ seconds of reference audio; the short previews
+# below are too short for that purpose).
+REFERENCE_TEXT = (
+    "This is a longer voice sample being generated so it can be used as a "
+    "reference clip for emotional voice cloning. It needs to run for about "
+    "fifteen seconds so there is enough audio for the cloning model to work with."
+)
 
 # Preview line spoken in each language so the sample is meaningful,
 # not just English text run through the wrong phonemizer.
@@ -133,11 +168,32 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
+# ---------------------------------------------------------------------------
+# Emotion tag helpers
+# ---------------------------------------------------------------------------
+
+def strip_disabled_tags(text: str, enabled_tags: set) -> str:
+    """Remove any [tag] from text whose tag name is NOT in enabled_tags.
+    Enabled tags are left exactly as-is."""
+
+    def _replace(match):
+        tag_name = match.group(1).strip().lower()
+        return match.group(0) if tag_name in enabled_tags else ""
+
+    return re.sub(r"\[([^\[\]]+)\]", _replace, text)
+
+
+def text_has_any_tag(text: str) -> bool:
+    return bool(re.search(r"\[[^\[\]]+\]", text))
+
+
 class VoiceEngine:
     """Wraps Kokoro pipelines, one per language code, created lazily."""
 
     def __init__(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Kokoro runs on CPU so the full GPU (only ~4GB on this machine)
+        # stays free for Chatterbox, which needs it more.
+        self.device = "cpu"
         self._pipelines = {}  # lang_code -> KPipeline
         self._lock = threading.Lock()
 
@@ -163,6 +219,63 @@ class VoiceEngine:
         return np.concatenate(chunks)
 
 
+class ChatterboxBridge:
+    """Talks to Chatterbox-Turbo (installed in its own separate venv,
+    chatterbox-env) via subprocess, so this app never has to import it
+    directly and can't be broken by its dependency tree."""
+
+    def __init__(self, kokoro_engine: VoiceEngine):
+        self.kokoro_engine = kokoro_engine
+
+    def _reference_clip_path(self, voice_id: str) -> str:
+        os.makedirs(REFERENCE_DIR, exist_ok=True)
+        return os.path.join(REFERENCE_DIR, f"{voice_id}_reference.wav")
+
+    def ensure_reference_clip(self, voice_id: str, lang_code: str) -> str:
+        ref_path = self._reference_clip_path(voice_id)
+        if os.path.exists(ref_path):
+            return ref_path
+        audio = self.kokoro_engine.synthesize(REFERENCE_TEXT, voice_id, lang_code, speed=1.0)
+        sf.write(ref_path, audio, SAMPLE_RATE)
+        return ref_path
+
+    def synthesize_chunk(self, text: str, voice_id: str, lang_code: str) -> np.ndarray:
+        """Generates ONE short chunk via Chatterbox and returns audio as a
+        numpy array resampled to SAMPLE_RATE, ready to concatenate with
+        Kokoro chunks."""
+        if not os.path.exists(CHATTERBOX_ENV_PYTHON):
+            raise RuntimeError(
+                "Chatterbox isn't installed (chatterbox-env not found next to this "
+                "script). Disable emotion tags to use fast Kokoro-only generation, "
+                "or run install_chatterbox.sh first."
+            )
+
+        reference_clip = self.ensure_reference_clip(voice_id, lang_code)
+        tmp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+
+        try:
+            result = subprocess.run(
+                [
+                    CHATTERBOX_ENV_PYTHON,
+                    CHATTERBOX_WORKER_SCRIPT,
+                    "--text", text,
+                    "--reference", reference_clip,
+                    "--output", tmp_path,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Chatterbox generation failed:\n{result.stderr.strip()}")
+
+            audio, sr = sf.read(tmp_path, dtype="float32")
+            print(f"[DEBUG] Chatterbox output sr={sr}, len={len(audio)}")
+            return resample_audio(audio, sr, SAMPLE_RATE)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+                
+
 class CharacterVoiceStudio(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -171,6 +284,7 @@ class CharacterVoiceStudio(ctk.CTk):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
         self.engine = VoiceEngine()
+        self.chatterbox_bridge = ChatterboxBridge(self.engine)
         self._save_after_id = None
 
         pygame.mixer.init()
@@ -337,10 +451,27 @@ class CharacterVoiceStudio(ctk.CTk):
         panel.grid_rowconfigure(1, weight=1)
         panel.grid_columnconfigure(0, weight=1)
 
+        # -- Title row: title label + Help button side by side ------------
+        title_row = ctk.CTkFrame(panel, fg_color="transparent")
+        title_row.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
+        title_row.grid_columnconfigure(0, weight=1)
+
         title = ctk.CTkLabel(
-            panel, text="Text to Generate", font=ctk.CTkFont(size=self._f(20), weight="bold")
+            title_row, text="Text to Generate", font=ctk.CTkFont(size=self._f(20), weight="bold")
         )
-        title.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="w")
+        title.grid(row=0, column=0, sticky="w")
+
+        help_button = ctk.CTkButton(
+            title_row,
+            text="? Help",
+            width=self._f(70),
+            height=self._f(30),
+            font=ctk.CTkFont(size=self._f(12)),
+            fg_color="gray30",
+            hover_color="gray20",
+            command=self._show_help_dialog,
+        )
+        help_button.grid(row=0, column=1, sticky="e")
 
         self.text_box = ctk.CTkTextbox(
             panel,
@@ -392,8 +523,36 @@ class CharacterVoiceStudio(ctk.CTk):
             command=lambda v: self.speed_value_label.configure(text=f"{v:.1f}x")
         )
 
+        # -- Emotion tag toggles --------------------------------------------
+        emotions_frame = ctk.CTkFrame(panel, corner_radius=10)
+        emotions_frame.grid(row=4, column=0, padx=16, pady=(0, 8), sticky="ew")
+        for col in range(3):
+            emotions_frame.grid_columnconfigure(col, weight=1)
+
+        emotions_title = ctk.CTkLabel(
+            emotions_frame,
+            text='Emotions - type "[tag]" in your text, e.g. "Ha! [laugh]" (click Help for details)',
+            font=ctk.CTkFont(size=self._f(12), weight="bold"),
+            wraplength=self._f(680),
+            justify="left",
+        )
+        emotions_title.grid(row=0, column=0, columnspan=3, padx=12, pady=(10, 4), sticky="w")
+
+        self.emotion_switches = {}
+        for idx, tag in enumerate(EMOTION_TAGS):
+            row = 1 + idx // 3
+            col = idx % 3
+            switch = ctk.CTkSwitch(
+                emotions_frame,
+                text=tag,
+                font=ctk.CTkFont(size=self._f(12)),
+            )
+            switch.select()  # enabled by default
+            switch.grid(row=row, column=col, padx=12, pady=4, sticky="w")
+            self.emotion_switches[tag] = switch
+
         action_row = ctk.CTkFrame(panel, fg_color="transparent")
-        action_row.grid(row=4, column=0, padx=16, pady=(4, 8), sticky="ew")
+        action_row.grid(row=5, column=0, padx=16, pady=(4, 8), sticky="ew")
         action_row.grid_columnconfigure(0, weight=3)
         action_row.grid_columnconfigure(1, weight=1)
 
@@ -418,7 +577,7 @@ class CharacterVoiceStudio(ctk.CTk):
         self.stop_button.grid(row=0, column=1, sticky="ew")
 
         self.generate_progress = ctk.CTkProgressBar(panel, mode="indeterminate")
-        self.generate_progress.grid(row=5, column=0, padx=16, pady=(0, 8), sticky="ew")
+        self.generate_progress.grid(row=6, column=0, padx=16, pady=(0, 8), sticky="ew")
         self.generate_progress.set(0)
 
         self.output_status_label = ctk.CTkLabel(
@@ -429,7 +588,78 @@ class CharacterVoiceStudio(ctk.CTk):
             justify="left",
             anchor="w",
         )
-        self.output_status_label.grid(row=6, column=0, padx=16, pady=(0, 16), sticky="ew")
+        self.output_status_label.grid(row=7, column=0, padx=16, pady=(0, 16), sticky="ew")
+
+    # ------------------------------------------------------------------
+    # Help dialog
+    # ------------------------------------------------------------------
+    def _show_help_dialog(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Help & Emotion Guide")
+        win.geometry(f"{self._f(560)}x{self._f(640)}")
+        win.grab_set()
+
+        scroll = ctk.CTkScrollableFrame(win, corner_radius=0)
+        scroll.pack(fill="both", expand=True, padx=16, pady=16)
+
+        def add_section(title_text, body_text):
+            t = ctk.CTkLabel(
+                scroll, text=title_text,
+                font=ctk.CTkFont(size=self._f(15), weight="bold"),
+                anchor="w", justify="left",
+            )
+            t.pack(fill="x", pady=(10, 2))
+            b = ctk.CTkLabel(
+                scroll, text=body_text,
+                font=ctk.CTkFont(size=self._f(12)),
+                anchor="w", justify="left", wraplength=self._f(480),
+            )
+            b.pack(fill="x", pady=(0, 4))
+
+        add_section(
+            "How this works",
+            "Kokoro handles normal narration - fast, and used by default. When "
+            "your text contains an enabled emotion tag like [laugh], that "
+            "generation is routed to Chatterbox instead, which clones the "
+            "current voice and performs the reaction for real, rather than "
+            "just reading the word."
+        )
+        add_section(
+            "Available emotion tags",
+            "[laugh]  [chuckle]  [cough]  [sigh]  [clear throat]  [shush]  "
+            "[groan]  [sniff]  [gasp]\n\n"
+            "Type them directly into your script, for example:\n"
+            "\"That's hilarious! [laugh] I can't believe it.\"\n"
+            "\"Well, [chuckle] I suppose that's one way to do it.\""
+        )
+        add_section(
+            "Enabling / disabling tags",
+            "Each tag has its own switch above the Generate button, ON by "
+            "default. Turning a tag OFF strips that specific tag out of your "
+            "text before generating - so a disabled [cough] is silently "
+            "removed and won't trigger Chatterbox on its own. If every tag in "
+            "your text ends up disabled, generation falls back to fast, "
+            "Kokoro-only narration automatically."
+        )
+        add_section(
+            "Known limitations",
+            "Emotion tags are a genuine trained feature, but Chatterbox's own "
+            "team has described them as hit-or-miss - not every tag will land "
+            "every time. Chatterbox generation is also noticeably slower than "
+            "Kokoro, and requires chatterbox-env to be installed alongside "
+            "this app (see install_chatterbox.sh)."
+        )
+        add_section(
+            "Example prompts to try",
+            "\"Oh man, [laugh] that's such a good story.\"\n"
+            "\"Sorry, excuse me, [cough] where was I?\"\n"
+            "\"[sigh] Fine, I'll take care of it myself.\"\n"
+            "\"Wait, [shush] do you hear that? [gasp] Never mind, it's just "
+            "the mailman.\""
+        )
+
+        close_btn = ctk.CTkButton(win, text="Close", command=win.destroy)
+        close_btn.pack(pady=(0, 16))
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -497,6 +727,7 @@ class CharacterVoiceStudio(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    
     def _on_generate_clicked(self):
         text = self.text_box.get("1.0", "end").strip()
         if not text:
@@ -509,19 +740,52 @@ class CharacterVoiceStudio(ctk.CTk):
         lang_code = self.selected_lang_code
         speed = float(self.speed_slider.get())
 
+        enabled_tags = {
+            tag for tag, switch in self.emotion_switches.items() if switch.get() == 1
+        }
+
         self.generate_button.configure(state="disabled")
         self.generate_progress.start()
-        self._set_label(self.output_status_label, f"Generating with '{voice_id}'...")
 
         def worker():
             try:
-                audio = self.engine.synthesize(text, voice_id, lang_code, speed=speed)
+                sentences = split_into_chunks(text)
+                groups = group_chunks_by_engine(sentences, enabled_tags)
+                if not groups:
+                    raise RuntimeError("Nothing to generate.")
+
+                audio_segments = []
+                total = len(groups)
+
+                for i, (engine, group_text) in enumerate(groups, start=1):
+                    if engine == "chatterbox":
+                        self._set_label(
+                            self.output_status_label,
+                            f"Group {i}/{total}: generating with emotion (Chatterbox)...",
+                        )
+                        seg = self.chatterbox_bridge.synthesize_chunk(
+                            group_text, voice_id, lang_code
+                        )
+                    else:
+                        self._set_label(
+                            self.output_status_label,
+                            f"Group {i}/{total}: generating (Kokoro)...",
+                        )
+                        seg = self.engine.synthesize(
+                            group_text, voice_id, lang_code, speed=speed
+                        )
+
+                    audio_segments.append(seg)
+                    audio_segments.append(silence(0.12))  # shorter pause between groups
+
+                final_audio = np.concatenate(audio_segments)
                 out_path = self._build_output_path(voice_id)
-                sf.write(out_path, audio, SAMPLE_RATE)
-                duration = len(audio) / SAMPLE_RATE
+                sf.write(out_path, final_audio, SAMPLE_RATE)
+                duration = len(final_audio) / SAMPLE_RATE
+
                 self._set_label(
                     self.output_status_label,
-                    f"Done! Saved to {out_path} ({duration:.1f}s). Playing now...",
+                    f"Done! Saved to {out_path} ({duration:.1f}s, {total} groups merged). Playing now...",
                 )
                 self._play_audio(out_path)
             except Exception as e:
@@ -618,6 +882,61 @@ class CharacterVoiceStudio(ctk.CTk):
         self._save_last_text()
         self.destroy()
 
+def split_into_chunks(text: str):
+    """Splits text into sentence-level pieces. group_chunks_by_engine then
+    merges consecutive same-engine sentences back together, so this is just
+    the tokenizing step, not the final chunking."""
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks = []
+    for para in paragraphs:
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        for s in sentences:
+            s = s.strip()
+            if s:
+                chunks.append(s)
+    return chunks
+
+def group_chunks_by_engine(sentences, enabled_tags, max_chars=280):
+    """Groups consecutive sentences that use the same engine into single
+    generation calls, so prosody flows naturally within each group instead
+    of resetting every sentence. Still splits on engine changes or when a
+    group gets too long (Chatterbox degrades on very long single passes)."""
+    groups = []
+    current_text = []
+    current_engine = None
+
+    def flush():
+        if current_text:
+            groups.append((current_engine, " ".join(current_text)))
+
+    for sentence in sentences:
+        filtered = strip_disabled_tags(sentence, enabled_tags)
+        if not filtered.strip():
+            continue
+
+        engine = "chatterbox" if text_has_any_tag(filtered) else "kokoro"
+        joined_len = sum(len(s) for s in current_text) + len(filtered)
+
+        if engine != current_engine or joined_len > max_chars:
+            flush()
+            current_text = [filtered]
+            current_engine = engine
+        else:
+            current_text.append(filtered)
+
+    flush()
+    return groups
+
+def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    if orig_sr == target_sr:
+        return audio.astype(np.float32)
+    g = gcd(orig_sr, target_sr)
+    up, down = target_sr // g, orig_sr // g
+    return resample_poly(audio, up, down).astype(np.float32)
+
+
+def silence(duration_sec: float, sr: int = SAMPLE_RATE) -> np.ndarray:
+    return np.zeros(int(duration_sec * sr), dtype=np.float32)
 
 if __name__ == "__main__":
     app = CharacterVoiceStudio()

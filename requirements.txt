@@ -25,4 +25,13 @@ pygame
 # --- UI ---
 customtkinter
 
+#--other---
+scipy
+
+
+# --- Optional: emotion tags via Chatterbox-Turbo ---
+# This is a SEPARATE venv (./chatterbox-env), not installed by this file.
+# Run install_chatterbox.sh once to enable [laugh]/[cough]/[sigh]/etc tags.
+# See requirements-chatterbox.txt for its dependencies.
+
 # --- Add future packages below, grouped by purpose ---

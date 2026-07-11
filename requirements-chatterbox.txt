@@ -1,0 +1,8 @@
+# Chatterbox-Turbo TTS - dependencies
+# Install with: pip install -r requirements-chatterbox.txt
+#
+# PyTorch/torchaudio pulled in automatically as chatterbox-tts dependencies,
+# but installed explicitly first in install_chatterbox.sh for CUDA control.
+
+chatterbox-tts
+pygame

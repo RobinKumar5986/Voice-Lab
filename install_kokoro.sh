@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Kokoro-82M TTS install for Ubuntu 24.04 (GTX 1650)
-# Run this from inside the project folder (e.g. ~/Desktop/Text to speech)
+# Run this from inside the project folder
 set -e
 
 echo "=== Installing system dependency: espeak-ng ==="
