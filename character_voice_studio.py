@@ -18,9 +18,20 @@ Features:
 6. {pause:N} marker for exact, controllable silence (e.g. {pause:0.6} for
    600ms) - real dead air inserted at that exact point, not something the
    TTS engine has to guess from punctuation.
-7. Help button explaining all of the above with example prompts.
+7. Help button explaining all of the above with example prompts (each
+   copyable with one click).
 8. Custom voices ("My Voices") can be deleted via a trash icon next to
    each row, with a confirm dialog before anything is removed.
+9. Multi-character dialogue: tag lines with "[Name]" in the text box to
+   switch speakers mid-generation.
+   - If "Name" is explicitly assigned to a voice in "🎭 Characters", that
+     assignment is used.
+   - Otherwise "Name" is auto-detected against existing voice names (e.g.
+     "[Bella]", "[Adam]", or any custom voice's name) - no setup required.
+   - Explicit assignment always wins over auto-detection. If two voices
+     share the same short name, the first one found is used.
+   - Untagged text keeps using the voice picked on the left, so
+     single-voice scripts are unaffected.
 
 Run:
     source ./kokoro-env/bin/activate
@@ -29,6 +40,7 @@ Run:
 
 import os
 import re
+import json
 import subprocess
 import tempfile
 import threading
@@ -62,6 +74,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REFERENCE_DIR = os.path.join(CHARACTER_SPEECH_DIR, "references")
 CHATTERBOX_ENV_PYTHON = os.path.join(SCRIPT_DIR, "chatterbox-env", "bin", "python3")
 CHATTERBOX_WORKER_SCRIPT = os.path.join(SCRIPT_DIR, "chatterbox_worker.py")
+CHARACTERS_FILE = os.path.join(SCRIPT_DIR, "characters.json")
 
 # Official Chatterbox-Turbo paralinguistic tags (confirmed by Resemble AI staff).
 # Note: these are documented as inconsistent/hit-or-miss, not a bug here.
@@ -207,6 +220,31 @@ def strip_disabled_tags(text: str, enabled_tags: set) -> str:
 
 def text_has_any_tag(text: str) -> bool:
     return bool(re.search(r"\[[^\[\]]+\]", text))
+
+
+def build_character_tag_regex(character_names):
+    """Builds a regex that matches "[Name]" ONLY for the given names
+    (case-insensitive) - a union of explicitly registered characters and
+    auto-detectable voice names. Kept separate from emotion tags so
+    "[laugh]" etc. are never mistaken for a speaker switch, and an unknown
+    "[SomeName]" is left alone as a normal (unrecognized) emotion tag."""
+    names = sorted({n for n in character_names if n}, key=len, reverse=True)
+    if not names:
+        return None
+    pattern = r"\[\s*(" + "|".join(re.escape(n) for n in names) + r")\s*\]"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def _voice_short_name(label: str) -> str:
+    """Strips the "★ " custom-voice prefix and any trailing "(Female)" /
+    "(Male)" style suffix off a voice's display label, so "Bella (Female)"
+    -> "Bella" and "★ MyCoolVoice" -> "MyCoolVoice". Used to auto-detect
+    "[Name]" tags against existing voice names."""
+    label = label.strip()
+    if label.startswith("★"):
+        label = label[1:].strip()
+    label = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip()
+    return label
 
 
 class VoiceEngine:
@@ -408,6 +446,55 @@ class ChatterboxBridge:
                                 cfg_weight=cfg_weight, temperature=temperature)
 
 
+class CharacterRegistry:
+    """Persists the character-name -> voice mapping used by multi-character
+    mode to characters.json, next to the other on-disk registries. Only
+    holds EXPLICIT assignments - auto-detected names are resolved on the
+    fly from the voice lists and never written here."""
+
+    def __init__(self, path: str = CHARACTERS_FILE):
+        self.path = path
+        self._data = {}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._data = json.load(f)
+            except Exception as e:
+                print(f"Could not load characters: {e}")
+                self._data = {}
+
+    def _save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2)
+        except Exception as e:
+            print(f"Could not save characters: {e}")
+
+    def add(self, name: str, voice_id: str, lang_code: str, voice_display: str):
+        key = name.strip().lower()
+        self._data[key] = {
+            "display_name": name.strip(),
+            "voice_id": voice_id,
+            "lang_code": lang_code,
+            "voice_display": voice_display,
+        }
+        self._save()
+
+    def delete(self, key: str):
+        if key in self._data:
+            del self._data[key]
+            self._save()
+
+    def get(self, key: str):
+        return self._data.get(key)
+
+    def all(self) -> dict:
+        return dict(self._data)
+
+
 class CharacterVoiceStudio(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -418,6 +505,7 @@ class CharacterVoiceStudio(ctk.CTk):
         self.engine = VoiceEngine()
         self.chatterbox_bridge = ChatterboxBridge(self.engine)
         self.voice_registry = VoiceRegistry()
+        self.character_registry = CharacterRegistry()
         self._save_after_id = None
 
         pygame.mixer.init()
@@ -690,7 +778,7 @@ class CharacterVoiceStudio(ctk.CTk):
         )
         help_button.grid(row=0, column=1, sticky="e")
 
-        # -- Pause quick-insert button ----------------------------------
+        # -- Pause / character quick-insert row ---------------------------
         filler_row = ctk.CTkFrame(panel, fg_color="transparent")
         filler_row.grid(row=1, column=0, padx=16, pady=(0, 4), sticky="w")
 
@@ -710,6 +798,40 @@ class CharacterVoiceStudio(ctk.CTk):
             command=self._insert_pause_marker,
         )
         pause_btn.pack(side="left", padx=(0, 4))
+
+        char_manage_btn = ctk.CTkButton(
+            filler_row,
+            text="🎭 Characters",
+            width=self._f(100),
+            height=self._f(24),
+            font=ctk.CTkFont(size=self._f(11)),
+            fg_color="gray30",
+            hover_color="gray20",
+            command=self._open_character_manager,
+        )
+        char_manage_btn.pack(side="left", padx=(8, 4))
+
+        self.character_insert_menu = ctk.CTkOptionMenu(
+            filler_row,
+            values=["(none)"],
+            width=self._f(140),
+            height=self._f(24),
+            font=ctk.CTkFont(size=self._f(11)),
+            dropdown_font=ctk.CTkFont(size=self._f(11)),
+        )
+        self.character_insert_menu.pack(side="left", padx=(4, 4))
+
+        char_insert_btn = ctk.CTkButton(
+            filler_row,
+            text="insert tag",
+            width=self._f(74),
+            height=self._f(24),
+            font=ctk.CTkFont(size=self._f(11)),
+            fg_color="gray30",
+            hover_color="gray20",
+            command=self._insert_character_tag,
+        )
+        char_insert_btn.pack(side="left")
 
         self.text_box = ctk.CTkTextbox(
             panel,
@@ -847,6 +969,8 @@ class CharacterVoiceStudio(ctk.CTk):
         )
         self.output_status_label.grid(row=8, column=0, padx=16, pady=(0, 16), sticky="ew")
 
+        self._refresh_character_insert_menu()
+
     def _insert_pause_marker(self):
         # Inserts a default 0.5s pause - edit the number directly in the
         # text box to change the duration, e.g. change to {pause:1.2}.
@@ -854,12 +978,208 @@ class CharacterVoiceStudio(ctk.CTk):
         self.text_box.focus_set()
 
     # ------------------------------------------------------------------
+    # Multi-character mode
+    # ------------------------------------------------------------------
+    def _get_all_voice_options(self):
+        """All voices a character can be assigned to, or auto-detected
+        against: bundled Kokoro voices plus anything in the "My Voices"
+        custom registry."""
+        options = [(name, vid, lang) for name, vid, lang in VOICES]
+        for key, meta in self.voice_registry.all_voices().items():
+            options.append(
+                (f"★ {meta['display_name']}", f"custom::{key}", meta.get("lang_code", "a"))
+            )
+        return options
+
+    def _build_voice_name_map(self):
+        """Maps a lowercased voice 'short name' (e.g. "bella" from "Bella
+        (Female)") to (voice_id, lang_code, label). This is what lets a
+        "[Name]" tag auto-select a voice without ever being registered in
+        the Characters manager. When two voices share a short name, the
+        first one encountered (bundled voices first, in list order, then
+        custom voices) wins."""
+        name_map = {}
+        for label, voice_id, lang_code in self._get_all_voice_options():
+            short_name = _voice_short_name(label).lower()
+            if short_name and short_name not in name_map:
+                name_map[short_name] = (voice_id, lang_code, label)
+        return name_map
+
+    def _refresh_character_insert_menu(self):
+        registered = self.character_registry.all()
+        names = [meta["display_name"] for meta in registered.values()]
+        seen_lower = {n.lower() for n in names}
+
+        auto_names = []
+        for label, _, _ in self._get_all_voice_options():
+            short = _voice_short_name(label)
+            if short.lower() not in seen_lower:
+                seen_lower.add(short.lower())
+                auto_names.append(short)
+        auto_names.sort()
+
+        values = names + auto_names
+        if not values:
+            values = ["(none)"]
+        self.character_insert_menu.configure(values=values)
+        self.character_insert_menu.set(values[0])
+
+    def _insert_character_tag(self):
+        name = self.character_insert_menu.get()
+        if name and name != "(none)":
+            self.text_box.insert("insert", f"[{name}] ")
+            self.text_box.focus_set()
+
+    def _open_character_manager(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Multi-Character Voices")
+        win.geometry(f"{self._f(480)}x{self._f(600)}")
+        win.grab_set()
+
+        intro = ctk.CTkLabel(
+            win,
+            text="Assign a voice to a name here if you want to pin it "
+                 "explicitly. If you don't, a \"[Name]\" tag that matches an "
+                 "existing voice (e.g. \"[Bella]\", \"[Adam]\", or one of "
+                 "your custom voices) is used automatically - no assignment "
+                 "needed. An explicit assignment here always wins.",
+            font=ctk.CTkFont(size=self._f(12)),
+            wraplength=self._f(440),
+            justify="left",
+        )
+        intro.pack(padx=16, pady=(16, 8), fill="x")
+
+        list_frame = ctk.CTkScrollableFrame(win, corner_radius=10)
+        list_frame.pack(padx=16, pady=(0, 8), fill="both", expand=True)
+        list_frame.grid_columnconfigure(0, weight=1)
+
+        def refresh_list():
+            for w in list_frame.winfo_children():
+                w.destroy()
+            characters = self.character_registry.all()
+            if not characters:
+                empty = ctk.CTkLabel(
+                    list_frame, text="No explicit assignments yet.\nAuto-detection is still active.",
+                    font=ctk.CTkFont(size=self._f(12)), text_color="gray60", justify="left",
+                )
+                empty.grid(row=0, column=0, padx=8, pady=8, sticky="w")
+                return
+            for i, (key, meta) in enumerate(characters.items()):
+                row = ctk.CTkFrame(list_frame, fg_color="transparent")
+                row.grid(row=i, column=0, padx=4, pady=3, sticky="ew")
+                row.grid_columnconfigure(0, weight=1)
+
+                label = ctk.CTkLabel(
+                    row,
+                    text=f"[{meta['display_name']}] → {meta.get('voice_display', meta['voice_id'])}",
+                    font=ctk.CTkFont(size=self._f(13)), anchor="w",
+                )
+                label.grid(row=0, column=0, sticky="ew")
+
+                del_btn = ctk.CTkButton(
+                    row, text="🗑", width=self._f(32), height=self._f(28),
+                    fg_color="gray30", hover_color="#8B2C2C",
+                    command=lambda k=key: do_delete(k),
+                )
+                del_btn.grid(row=0, column=1, padx=(4, 0))
+
+        def do_delete(key):
+            self.character_registry.delete(key)
+            refresh_list()
+            self._refresh_character_insert_menu()
+
+        refresh_list()
+
+        add_frame = ctk.CTkFrame(win, corner_radius=10)
+        add_frame.pack(padx=16, pady=(0, 16), fill="x")
+        add_frame.grid_columnconfigure(0, weight=1)
+
+        name_entry = ctk.CTkEntry(add_frame, placeholder_text="Character name, e.g. Bob")
+        name_entry.grid(row=0, column=0, padx=12, pady=(12, 4), sticky="ew")
+
+        voice_options = self._get_all_voice_options()
+        voice_labels = [label for label, _, _ in voice_options]
+        voice_menu = ctk.CTkOptionMenu(add_frame, values=voice_labels or ["(no voices)"])
+        if voice_labels:
+            voice_menu.set(voice_labels[0])
+        voice_menu.grid(row=1, column=0, padx=12, pady=(0, 4), sticky="ew")
+
+        status_label = ctk.CTkLabel(
+            add_frame, text="", font=ctk.CTkFont(size=self._f(11)), text_color="orange"
+        )
+        status_label.grid(row=2, column=0, padx=12, pady=(0, 4), sticky="w")
+
+        def do_add():
+            name = name_entry.get().strip()
+            if not name:
+                status_label.configure(text="Enter a character name.")
+                return
+            if not re.match(r"^[A-Za-z0-9 _-]+$", name):
+                status_label.configure(text="Use letters, numbers, spaces, - or _ only.")
+                return
+            selected_label = voice_menu.get()
+            match = next((o for o in voice_options if o[0] == selected_label), None)
+            if not match:
+                status_label.configure(text="Pick a voice first.")
+                return
+            _, voice_id, lang_code = match
+            self.character_registry.add(name, voice_id, lang_code, selected_label)
+            name_entry.delete(0, "end")
+            status_label.configure(text=f"Added '{name}'.")
+            refresh_list()
+            self._refresh_character_insert_menu()
+
+        add_btn = ctk.CTkButton(add_frame, text="+ Add Character", command=do_add)
+        add_btn.grid(row=3, column=0, padx=12, pady=(0, 12), sticky="ew")
+
+        close_btn = ctk.CTkButton(win, text="Close", command=win.destroy)
+        close_btn.pack(pady=(0, 16))
+
+    def _resolve_voice_selection(self, voice_id: str, fallback_lang_code: str = "a"):
+        """Resolves a voice_id (bundled or "custom::<key>") into everything
+        the generation loop needs to synthesize with it. Returns None if a
+        referenced custom voice no longer exists."""
+        if voice_id.startswith("custom::"):
+            key = voice_id.split("custom::", 1)[1]
+            meta = self.voice_registry.get(key)
+            if meta is None:
+                return None
+            is_clone = meta.get("type") == "clone"
+            is_mix = meta.get("type") == "mix"
+            return {
+                "key": key,
+                "meta": meta,
+                "is_clone": is_clone,
+                "is_mix": is_mix,
+                "lang_code": meta.get("lang_code", fallback_lang_code),
+                "synth_voice_id": meta.get("voice_id") if is_mix else None,
+            }
+
+        lang_code = fallback_lang_code
+        for _, vid, vlang in VOICES:
+            if vid == voice_id:
+                lang_code = vlang
+                break
+        return {
+            "key": voice_id,
+            "meta": None,
+            "is_clone": False,
+            "is_mix": False,
+            "lang_code": lang_code,
+            "synth_voice_id": voice_id,
+        }
+
+    # ------------------------------------------------------------------
     # Help dialog
     # ------------------------------------------------------------------
+    def _copy_to_clipboard(self, text: str):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
     def _show_help_dialog(self):
         win = ctk.CTkToplevel(self)
         win.title("Help & Emotion Guide")
-        win.geometry(f"{self._f(560)}x{self._f(640)}")
+        win.geometry(f"{self._f(600)}x{self._f(700)}")
         win.grab_set()
 
         scroll = ctk.CTkScrollableFrame(win, corner_radius=0)
@@ -875,9 +1195,41 @@ class CharacterVoiceStudio(ctk.CTk):
             b = ctk.CTkLabel(
                 scroll, text=body_text,
                 font=ctk.CTkFont(size=self._f(12)),
-                anchor="w", justify="left", wraplength=self._f(480),
+                anchor="w", justify="left", wraplength=self._f(500),
             )
             b.pack(fill="x", pady=(0, 4))
+
+        def add_examples_section(title_text, intro_text, examples):
+            t = ctk.CTkLabel(
+                scroll, text=title_text,
+                font=ctk.CTkFont(size=self._f(15), weight="bold"),
+                anchor="w", justify="left",
+            )
+            t.pack(fill="x", pady=(10, 2))
+            if intro_text:
+                b = ctk.CTkLabel(
+                    scroll, text=intro_text,
+                    font=ctk.CTkFont(size=self._f(12)),
+                    anchor="w", justify="left", wraplength=self._f(500),
+                )
+                b.pack(fill="x", pady=(0, 6))
+            for example in examples:
+                row = ctk.CTkFrame(scroll, fg_color="transparent")
+                row.pack(fill="x", pady=2)
+                row.grid_columnconfigure(0, weight=1)
+                lbl = ctk.CTkLabel(
+                    row, text=example,
+                    font=ctk.CTkFont(size=self._f(12)),
+                    anchor="w", justify="left", wraplength=self._f(420),
+                )
+                lbl.grid(row=0, column=0, sticky="ew")
+                copy_btn = ctk.CTkButton(
+                    row, text="Copy", width=self._f(56), height=self._f(24),
+                    font=ctk.CTkFont(size=self._f(11)),
+                    fg_color="gray30", hover_color="gray20",
+                    command=lambda ex=example: self._copy_to_clipboard(ex),
+                )
+                copy_btn.grid(row=0, column=1, padx=(8, 0))
 
         add_section(
             "How this works",
@@ -931,15 +1283,46 @@ class CharacterVoiceStudio(ctk.CTk):
             "Kokoro, and requires chatterbox-env to be installed alongside "
             "this app (see install_chatterbox.sh)."
         )
-        add_section(
+
+        add_examples_section(
             "Example prompts to try",
-            "\"Oh man, [laugh] that's such a good story.\"\n"
-            "\"Sorry, excuse me, [cough] where was I?\"\n"
-            "\"[sigh] Fine, I'll take care of it myself.\"\n"
-            "\"Okay, {pause:0.4} let me think about this. {pause:0.6} Alright.\"\n"
-            "\"Wait, [shush] do you hear that? [gasp] Never mind, it's just "
-            "the mailman.\""
+            None,
+            [
+                "Oh man, [laugh] that's such a good story.",
+                "Sorry, excuse me, [cough] where was I?",
+                "[sigh] Fine, I'll take care of it myself.",
+                "Okay, {pause:0.4} let me think about this. {pause:0.6} Alright.",
+                "Wait, [shush] do you hear that? [gasp] Never mind, it's just the mailman.",
+            ],
         )
+
+        add_section(
+            "Multi-character dialogue",
+            "Tag a line with \"[Name]\" to switch speakers - everything after "
+            "the tag uses that voice until the next tag or the end of the "
+            "text. If \"Name\" matches an existing voice (a bundled voice "
+            "like \"Bella\" or \"Adam\", or one of your custom voices), that "
+            "voice is used automatically - no setup required. Open "
+            "'🎭 Characters' only if you want to pin a name to a specific "
+            "voice explicitly; an explicit assignment always wins over "
+            "auto-detection, and if two voices share the same short name the "
+            "first match wins. Lines with no tag use whichever voice is "
+            "selected on the left. Only names that resolve to a voice "
+            "trigger a speaker switch - anything else in square brackets is "
+            "still treated as a normal emotion tag, so [laugh], [sigh] etc. "
+            "keep working inside multi-character lines too."
+        )
+
+        add_examples_section(
+            "Multi-character examples",
+            "These work immediately using auto-detected bundled voice names - no character setup needed:",
+            [
+                "[Bella] Hey, are you coming to the meeting?\n[Adam] Yeah, [laugh] give me two minutes.",
+                "[Sarah] The room fell silent. {pause:0.5}\n[Adam] [sigh] I never wanted this.",
+                "[Bella] Wait, [gasp] is that really you?\n[Adam] [chuckle] In the flesh.",
+            ],
+        )
+
         add_section(
             "Managing custom voices",
             "Custom voices you create in '+ Create New Voice' show up under "
@@ -1138,26 +1521,21 @@ class CharacterVoiceStudio(ctk.CTk):
 
         self._save_last_text()
 
-        lang_code = self.selected_lang_code
+        main_resolved = self._resolve_voice_selection(voice_id, self.selected_lang_code)
+        if main_resolved is None:
+            self._set_label(self.output_status_label, "Selected voice no longer exists.")
+            return
+
         speed = float(self.speed_slider.get())
         exaggeration = float(self.intensity_slider.get())
 
-        # Custom voices (from the "Create New Voice" panel) are prefixed
-        # "custom::<key>" - resolve what kind it is up front so the loop
-        # below knows how to route each group.
-        is_custom = voice_id.startswith("custom::")
-        custom_key = voice_id.split("custom::", 1)[1] if is_custom else None
-        custom_meta = self.voice_registry.get(custom_key) if is_custom else None
-        is_clone = bool(custom_meta and custom_meta.get("type") == "clone")
-        is_mix = bool(custom_meta and custom_meta.get("type") == "mix")
-        if is_mix:
-            lang_code = custom_meta.get("lang_code", lang_code)
-
-        # A cloned voice pins the seed you picked in the lab so its accent
-        # stays consistent between generations, plus its delivery knobs.
-        clone_seed = custom_meta.get("seed") if is_clone else None
-        clone_cfg = custom_meta.get("cfg_weight", 0.5) if is_clone else 0.5
-        clone_temp = custom_meta.get("temperature", 0.8) if is_clone else 0.8
+        # Snapshot the character map and build the auto-detect voice-name
+        # map for this run, then union both into the tag regex so a "[Name]"
+        # matches whichever one applies (explicit takes priority later).
+        characters = self.character_registry.all()
+        voice_name_map = self._build_voice_name_map()
+        all_names = set(characters.keys()) | set(voice_name_map.keys())
+        character_tag_re = build_character_tag_regex(all_names)
 
         enabled_tags = {
             tag for tag, switch in self.emotion_switches.items() if switch.get() == 1
@@ -1168,7 +1546,7 @@ class CharacterVoiceStudio(ctk.CTk):
 
         def worker():
             try:
-                items = split_into_chunks(text)
+                items = split_into_chunks(text, character_tag_re)
                 groups = group_chunks_by_engine(items, enabled_tags)
                 if not groups:
                     raise RuntimeError("Nothing to generate.")
@@ -1188,46 +1566,69 @@ class CharacterVoiceStudio(ctk.CTk):
                         audio_segments.append(silence(seconds))
                         continue
 
-                    if is_clone:
-                        # A cloned voice has no Kokoro identity to fall back
-                        # on - every line (tagged or not) goes through
-                        # Chatterbox using the imported reference recording.
+                    # Resolve which voice this group should use: an explicit
+                    # character assignment first, then an auto-detected
+                    # voice-name match, otherwise the voice picked on the
+                    # left panel.
+                    resolved = main_resolved
+                    speaker_label = None
+                    speaker_key = group.get("speaker")
+                    if speaker_key:
+                        char_meta = characters.get(speaker_key)
+                        if char_meta:
+                            candidate = self._resolve_voice_selection(
+                                char_meta["voice_id"], char_meta.get("lang_code", "a")
+                            )
+                            if candidate:
+                                resolved = candidate
+                                speaker_label = char_meta["display_name"]
+                        else:
+                            auto = voice_name_map.get(speaker_key)
+                            if auto:
+                                auto_voice_id, auto_lang_code, auto_label = auto
+                                candidate = self._resolve_voice_selection(auto_voice_id, auto_lang_code)
+                                if candidate:
+                                    resolved = candidate
+                                    speaker_label = _voice_short_name(auto_label)
+
+                    status_who = f" as {speaker_label}" if speaker_label else ""
+
+                    if resolved["is_clone"]:
                         self._set_label(
                             self.output_status_label,
-                            f"Group {i}/{total}: generating with your cloned voice...",
+                            f"Group {i}/{total}: generating{status_who} (cloned voice)...",
                         )
                         seg = self.chatterbox_bridge.synthesize_chunk_with_reference(
-                            group["text"], custom_meta["reference_path"],
-                            exaggeration=exaggeration, seed=clone_seed,
-                            cfg_weight=clone_cfg, temperature=clone_temp,
+                            group["text"], resolved["meta"]["reference_path"],
+                            exaggeration=exaggeration, seed=resolved["meta"].get("seed"),
+                            cfg_weight=resolved["meta"].get("cfg_weight", 0.5),
+                            temperature=resolved["meta"].get("temperature", 0.8),
                         )
                     elif engine == "chatterbox":
                         self._set_label(
                             self.output_status_label,
-                            f"Group {i}/{total}: generating with emotion (Chatterbox)...",
+                            f"Group {i}/{total}: generating{status_who} with emotion (Chatterbox)...",
                         )
-                        synth_voice = custom_meta["voice_id"] if is_mix else voice_id
                         seg = self.chatterbox_bridge.synthesize_chunk(
-                            group["text"], synth_voice, lang_code,
+                            group["text"], resolved["synth_voice_id"], resolved["lang_code"],
                             exaggeration=exaggeration,
-                            reference_key=custom_key if is_mix else None,
+                            reference_key=resolved["key"] if resolved["is_mix"] else None,
                         )
                     else:
                         self._set_label(
                             self.output_status_label,
-                            f"Group {i}/{total}: generating (Kokoro)...",
+                            f"Group {i}/{total}: generating{status_who} (Kokoro)...",
                         )
-                        synth_voice = custom_meta["voice_id"] if is_mix else voice_id
                         seg = self.engine.synthesize(
-                            group["text"], synth_voice, lang_code, speed=speed
+                            group["text"], resolved["synth_voice_id"], resolved["lang_code"],
+                            speed=speed,
                         )
 
                     audio_segments.append(seg)
                     audio_segments.append(silence(0.12))  # shorter pause between groups
 
                 final_audio = np.concatenate(audio_segments)
-                out_path_label = custom_key if is_custom else voice_id
-                out_path = self._build_output_path(out_path_label)
+                out_path = self._build_output_path(main_resolved["key"])
                 sf.write(out_path, final_audio, SAMPLE_RATE)
                 duration = len(final_audio) / SAMPLE_RATE
 
@@ -1336,30 +1737,48 @@ def _split_sentences(text: str):
     return [s.strip() for s in sentences if s.strip()]
 
 
-def split_into_chunks(text: str):
+def split_into_chunks(text: str, character_tag_re=None):
     """Tokenizes text into an ordered list of items:
       {"type": "sentence", "text": "..."}     - normal narration
       {"type": "pause", "seconds": 0.6}       - a {pause:N} marker
+      {"type": "speaker", "key": "bob"}       - a "[Name]" speaker switch
 
-    Markers are pulled out first so they survive as their own ordered token
-    instead of getting mangled by sentence splitting; group_chunks_by_engine
-    then decides what engine/audio each item maps to.
+    Markers/tags are pulled out first (in original left-to-right order) so
+    they survive as their own ordered tokens instead of getting mangled by
+    sentence splitting; group_chunks_by_engine then decides what engine and
+    voice each item maps to. `character_tag_re` only matches names that are
+    actually resolvable (explicit character or auto-detected voice), so an
+    unrecognized "[Name]" is left untouched in the text (and handled later
+    as an emotion tag, same as always).
     """
     items = []
     for para in text.split("\n"):
         if not para.strip():
             continue
 
+        tokens = [("pause", m.start(), m.end(), m.group(1)) for m in MARKER_RE.finditer(para)]
+        if character_tag_re:
+            tokens += [
+                ("speaker", m.start(), m.end(), m.group(1))
+                for m in character_tag_re.finditer(para)
+            ]
+        tokens.sort(key=lambda t: t[1])
+
         pos = 0
-        for m in MARKER_RE.finditer(para):
-            before = para[pos:m.start()]
+        for kind, start, end, val in tokens:
+            if start < pos:
+                continue  # overlapping match (shouldn't normally happen) - skip
+            before = para[pos:start]
             for s in _split_sentences(before):
                 items.append({"type": "sentence", "text": s})
 
-            seconds = max(0.0, min(float(m.group(1)), MAX_PAUSE_SECONDS))
-            items.append({"type": "pause", "seconds": seconds})
+            if kind == "pause":
+                seconds = max(0.0, min(float(val), MAX_PAUSE_SECONDS))
+                items.append({"type": "pause", "seconds": seconds})
+            else:
+                items.append({"type": "speaker", "key": val.strip().lower()})
 
-            pos = m.end()
+            pos = end
 
         remainder = para[pos:]
         for s in _split_sentences(remainder):
@@ -1369,24 +1788,38 @@ def split_into_chunks(text: str):
 
 
 def group_chunks_by_engine(items, enabled_tags, max_chars=280):
-    """Groups consecutive same-engine sentence items into single generation
-    calls (so prosody flows naturally within each group). Still splits on
-    engine changes, on a {pause:N} marker, or when a group gets too long
-    (Chatterbox degrades on very long single passes)."""
+    """Groups consecutive same-engine, same-speaker sentence items into
+    single generation calls (so prosody flows naturally within each group).
+    Still splits on engine changes, speaker changes, a {pause:N} marker, or
+    when a group gets too long (Chatterbox degrades on very long single
+    passes)."""
     groups = []
     current_text = []
     current_engine = None
+    current_speaker = None
+    active_speaker = None  # persists across pauses/flushes until changed
 
     def flush():
         if current_text:
-            groups.append({"engine": current_engine, "text": " ".join(current_text)})
+            groups.append({
+                "engine": current_engine,
+                "text": " ".join(current_text),
+                "speaker": current_speaker,
+            })
 
     for item in items:
+        if item["type"] == "speaker":
+            flush()
+            current_text = []
+            current_engine = None
+            active_speaker = item["key"]
+            continue
+
         if item["type"] == "pause":
             flush()
             current_text = []
             current_engine = None
-            groups.append({"engine": "pause", "seconds": item["seconds"]})
+            groups.append({"engine": "pause", "seconds": item["seconds"], "speaker": active_speaker})
             continue
 
         filtered = strip_disabled_tags(item["text"], enabled_tags)
@@ -1396,10 +1829,11 @@ def group_chunks_by_engine(items, enabled_tags, max_chars=280):
         engine = "chatterbox" if text_has_any_tag(filtered) else "kokoro"
         joined_len = sum(len(s) for s in current_text) + len(filtered)
 
-        if engine != current_engine or joined_len > max_chars:
+        if engine != current_engine or joined_len > max_chars or active_speaker != current_speaker:
             flush()
             current_text = [filtered]
             current_engine = engine
+            current_speaker = active_speaker
         else:
             current_text.append(filtered)
 

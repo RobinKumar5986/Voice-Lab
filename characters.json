@@ -1,0 +1,14 @@
+{
+  "jake": {
+    "display_name": "Jake",
+    "voice_id": "custom::modi_ji",
+    "lang_code": "a",
+    "voice_display": "\u2605 Modi ji"
+  },
+  "mia": {
+    "display_name": "Mia",
+    "voice_id": "af_nova",
+    "lang_code": "a",
+    "voice_display": "Nova (Female)"
+  }
+}
