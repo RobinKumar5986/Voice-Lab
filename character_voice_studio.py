@@ -13,7 +13,14 @@ Features:
    If your text contains an enabled tag, that line is routed to
    Chatterbox-Turbo (real trained emotion) instead of Kokoro. Disabled
    tags are silently stripped from the text before generating.
-5. Help button explaining all of the above with example prompts.
+5. Emotion intensity slider - controls how strongly Chatterbox leans into
+   the emotional/expressive character of a tagged line.
+6. {pause:N} marker for exact, controllable silence (e.g. {pause:0.6} for
+   600ms) - real dead air inserted at that exact point, not something the
+   TTS engine has to guess from punctuation.
+7. Help button explaining all of the above with example prompts.
+8. Custom voices ("My Voices") can be deleted via a trash icon next to
+   each row, with a confirm dialog before anything is removed.
 
 Run:
     source ./kokoro-env/bin/activate
@@ -39,6 +46,8 @@ from kokoro import KPipeline
 from scipy.signal import resample_poly
 from math import gcd
 
+from voice_lab import VoiceRegistry, VoiceLabWindow, CUSTOM_PREVIEW_DIR
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -60,6 +69,19 @@ EMOTION_TAGS = [
     "laugh", "chuckle", "cough", "sigh",
     "clear throat", "shush", "groan", "sniff", "gasp",
 ]
+
+# "{pause:N}" inserts N seconds of real silence at that exact spot - see
+# MARKER_RE / split_into_chunks below.
+#
+# {curly braces} are used rather than the [square brackets] the emotion tags
+# use, on purpose: reusing [square brackets] would make strip_disabled_tags()
+# treat "{pause:0.6}" as an unrecognized emotion tag and silently delete it,
+# since it wouldn't be in the enabled-tags set.
+MAX_PAUSE_SECONDS = 10.0  # sanity clamp so a typo can't stall generation for minutes
+MARKER_RE = re.compile(
+    r"\{\s*pause\s*:\s*([\d.]+)\s*\}",
+    re.IGNORECASE,
+)
 
 # Longer sample text used ONLY to build a Chatterbox reference clip per voice
 # (Chatterbox requires 5+ seconds of reference audio; the short previews
@@ -205,13 +227,67 @@ class VoiceEngine:
                 )
             return self._pipelines[lang_code]
 
+    def _build_blend_voice(self, pipeline, voice_id: str):
+        """Build a single blended voice tensor from a spec like
+        "af_bella(0.7),af_sky(0.3)" (or an unweighted "af_bella,af_sky").
+
+        Base Kokoro only averages comma-separated voices *equally* and does
+        NOT understand the (weight) syntax - it would try to load a voice
+        literally named "af_bella(0.7)" and fail. So we resolve and weight the
+        underlying voice tensors ourselves, then hand Kokoro the finished
+        tensor through its voice cache.
+        """
+        loader = getattr(pipeline, "load_voice", None) or getattr(
+            pipeline, "load_single_voice"
+        )
+
+        entries = []
+        for part in voice_id.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.match(r"^(.+?)\s*\(\s*([\d.]+)\s*\)\s*$", part)
+            if m:
+                entries.append((m.group(1).strip(), float(m.group(2))))
+            else:
+                entries.append((part, 1.0))
+        if not entries:
+            raise RuntimeError(f"Empty voice spec: {voice_id!r}")
+
+        total = sum(w for _, w in entries) or 1.0
+        blended = None
+        for name, weight in entries:
+            pack = loader(name)
+            contrib = pack * (weight / total)
+            blended = contrib if blended is None else blended + contrib
+        return blended
+
     def synthesize(self, text: str, voice_id: str, lang_code: str, speed: float = 1.0):
-        """Returns concatenated float32 numpy audio at SAMPLE_RATE."""
+        """Returns concatenated float32 numpy audio at SAMPLE_RATE.
+
+        `voice_id` can be a single bundled voice ("af_bella") or a blend spec
+        ("af_bella(0.7),af_sky(0.3)") from the "Create New Voice" panel
+        (voice_lab.py) for mixed custom voices. Blends are resolved to a real
+        voice tensor here (see _build_blend_voice) rather than passed to
+        Kokoro as a string it cannot parse.
+        """
         import numpy as np
 
         pipeline = self.get_pipeline(lang_code)
+
+        voice_arg = voice_id
+        if ("," in voice_id) or ("(" in voice_id):
+            blended = self._build_blend_voice(pipeline, voice_id)
+            # Stash under the spec string so Kokoro's load_voice returns it
+            # directly (it checks its cache before loading from disk).
+            try:
+                pipeline.voices[voice_id] = blended
+            except Exception:
+                pass
+            voice_arg = voice_id
+
         chunks = []
-        generator = pipeline(text, voice=voice_id, speed=speed, split_pattern=r"\n+")
+        generator = pipeline(text, voice=voice_arg, speed=speed, split_pattern=r"\n+")
         for _, _, audio in generator:
             chunks.append(audio)
         if not chunks:
@@ -227,22 +303,36 @@ class ChatterboxBridge:
     def __init__(self, kokoro_engine: VoiceEngine):
         self.kokoro_engine = kokoro_engine
 
-    def _reference_clip_path(self, voice_id: str) -> str:
+    def _reference_clip_path(self, key: str) -> str:
         os.makedirs(REFERENCE_DIR, exist_ok=True)
-        return os.path.join(REFERENCE_DIR, f"{voice_id}_reference.wav")
+        return os.path.join(REFERENCE_DIR, f"{key}_reference.wav")
 
     def ensure_reference_clip(self, voice_id: str, lang_code: str) -> str:
-        ref_path = self._reference_clip_path(voice_id)
+        """Reference-clip builder for a single bundled voice (key == voice_id,
+        since bundled voice ids are already filename-safe)."""
+        return self.ensure_reference_clip_for_key(voice_id, voice_id, lang_code)
+
+    def ensure_reference_clip_for_key(self, key: str, synth_voice_id: str, lang_code: str) -> str:
+        """Same as ensure_reference_clip, but `key` (used only for the cache
+        filename) can differ from `synth_voice_id` (what's actually handed to
+        Kokoro). This lets a mixed voice like "af_bella(0.7),af_sky(0.3)" -
+        not a valid filename - be cached under a clean custom-voice key
+        instead."""
+        ref_path = self._reference_clip_path(key)
         if os.path.exists(ref_path):
             return ref_path
-        audio = self.kokoro_engine.synthesize(REFERENCE_TEXT, voice_id, lang_code, speed=1.0)
+        audio = self.kokoro_engine.synthesize(REFERENCE_TEXT, synth_voice_id, lang_code, speed=1.0)
         sf.write(ref_path, audio, SAMPLE_RATE)
         return ref_path
 
-    def synthesize_chunk(self, text: str, voice_id: str, lang_code: str) -> np.ndarray:
-        """Generates ONE short chunk via Chatterbox and returns audio as a
-        numpy array resampled to SAMPLE_RATE, ready to concatenate with
-        Kokoro chunks."""
+    def _run_worker(self, text: str, reference_clip: str, exaggeration: float,
+                    seed=None, cfg_weight: float = 0.5, temperature: float = 0.8) -> np.ndarray:
+        """`seed` (if not None) is forwarded to the worker so generation is
+        reproducible - this is what pins a cloned voice's accent/take so it
+        doesn't drift between runs. `cfg_weight` (guidance/pacing) and
+        `temperature` (variety) are the other Chatterbox delivery knobs; the
+        worker drops any the installed model doesn't support. Note: none of
+        these change the ACCENT - accent comes from the reference clip."""
         if not os.path.exists(CHATTERBOX_ENV_PYTHON):
             raise RuntimeError(
                 "Chatterbox isn't installed (chatterbox-env not found next to this "
@@ -250,21 +340,23 @@ class ChatterboxBridge:
                 "or run install_chatterbox.sh first."
             )
 
-        reference_clip = self.ensure_reference_clip(voice_id, lang_code)
         tmp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
 
+        cmd = [
+            CHATTERBOX_ENV_PYTHON,
+            CHATTERBOX_WORKER_SCRIPT,
+            "--text", text,
+            "--reference", reference_clip,
+            "--output", tmp_path,
+            "--exaggeration", str(exaggeration),
+            "--cfg-weight", str(cfg_weight),
+            "--temperature", str(temperature),
+        ]
+        if seed is not None:
+            cmd += ["--seed", str(int(seed))]
+
         try:
-            result = subprocess.run(
-                [
-                    CHATTERBOX_ENV_PYTHON,
-                    CHATTERBOX_WORKER_SCRIPT,
-                    "--text", text,
-                    "--reference", reference_clip,
-                    "--output", tmp_path,
-                ],
-                capture_output=True,
-                text=True,
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError(f"Chatterbox generation failed:\n{result.stderr.strip()}")
 
@@ -274,7 +366,47 @@ class ChatterboxBridge:
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-                
+
+    def synthesize_chunk(
+        self,
+        text: str,
+        voice_id: str,
+        lang_code: str,
+        exaggeration: float = 0.5,
+        reference_key: str = None,
+        seed=None,
+        cfg_weight: float = 0.5,
+        temperature: float = 0.8,
+    ) -> np.ndarray:
+        """Generates ONE short chunk via Chatterbox and returns audio as a
+        numpy array resampled to SAMPLE_RATE, ready to concatenate with
+        Kokoro chunks. `exaggeration` controls how strongly the emotional/
+        expressive character comes through (higher = more intense).
+        `reference_key` overrides the cache filename - pass a custom voice's
+        registry key here when `voice_id` itself isn't filename-safe (e.g. a
+        mixed-voice blend string). `seed`/`cfg_weight`/`temperature` are the
+        Chatterbox delivery knobs."""
+        key = reference_key or voice_id
+        reference_clip = self.ensure_reference_clip_for_key(key, voice_id, lang_code)
+        return self._run_worker(text, reference_clip, exaggeration, seed=seed,
+                                cfg_weight=cfg_weight, temperature=temperature)
+
+    def synthesize_chunk_with_reference(
+        self,
+        text: str,
+        reference_path: str,
+        exaggeration: float = 0.5,
+        seed=None,
+        cfg_weight: float = 0.5,
+        temperature: float = 0.8,
+    ) -> np.ndarray:
+        """Generates ONE short chunk via Chatterbox using an explicit
+        reference clip (e.g. a user-imported recording for a cloned custom
+        voice) instead of one built from a Kokoro voice. `seed`/`cfg_weight`/
+        `temperature` are the delivery knobs; accent comes from the clip."""
+        return self._run_worker(text, reference_path, exaggeration, seed=seed,
+                                cfg_weight=cfg_weight, temperature=temperature)
+
 
 class CharacterVoiceStudio(ctk.CTk):
     def __init__(self):
@@ -285,6 +417,7 @@ class CharacterVoiceStudio(ctk.CTk):
 
         self.engine = VoiceEngine()
         self.chatterbox_bridge = ChatterboxBridge(self.engine)
+        self.voice_registry = VoiceRegistry()
         self._save_after_id = None
 
         pygame.mixer.init()
@@ -339,8 +472,10 @@ class CharacterVoiceStudio(ctk.CTk):
         )
         title.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="w")
 
-        # Language selector - filters which voices show up below
-        language_labels = [lbl for lbl, _, _ in LANGUAGES]
+        # Language selector - filters which voices show up below. The final
+        # entry is a pseudo-language that shows custom voices from the
+        # "Create New Voice" panel instead of a bundled-language filter.
+        language_labels = [lbl for lbl, _, _ in LANGUAGES] + ["★ My Voices"]
         self.language_menu = ctk.CTkOptionMenu(
             panel,
             values=language_labels,
@@ -395,23 +530,85 @@ class CharacterVoiceStudio(ctk.CTk):
         self._populate_voice_list(self.current_lang_code)
 
         self.preview_progress = ctk.CTkProgressBar(panel, mode="indeterminate")
-        self.preview_progress.grid(row=6, column=0, padx=16, pady=(0, 16), sticky="ew")
+        self.preview_progress.grid(row=6, column=0, padx=16, pady=(0, 8), sticky="ew")
         self.preview_progress.set(0)
 
+        create_voice_button = ctk.CTkButton(
+            panel,
+            text="+ Create New Voice",
+            command=self._open_voice_lab,
+            height=self._f(38),
+            font=ctk.CTkFont(size=self._f(13), weight="bold"),
+            fg_color="gray30",
+            hover_color="gray20",
+        )
+        create_voice_button.grid(row=7, column=0, padx=16, pady=(0, 16), sticky="ew")
+
+    def _open_voice_lab(self):
+        VoiceLabWindow(
+            self,
+            engine=self.engine,
+            chatterbox_bridge=self.chatterbox_bridge,
+            registry=self.voice_registry,
+            voices=VOICES,
+            preview_texts=PREVIEW_TEXTS,
+            sample_rate=SAMPLE_RATE,
+            on_voice_created=self._on_custom_voice_created,
+            scale=self.scale,
+        )
+
+    def _on_custom_voice_created(self):
+        if self.current_lang_code == "custom":
+            self.after(0, lambda: self._populate_voice_list("custom"))
+
     def _populate_voice_list(self, lang_code: str):
-        """Clear and rebuild the scrollable voice list for a given language."""
+        """Clear and rebuild the scrollable voice list for a given language
+        (or the custom "My Voices" list when lang_code == "custom")."""
         for widget in self.voice_list_frame.winfo_children():
             widget.destroy()
         self.voice_buttons = {}
 
-        matching_voices = [v for v in VOICES if v[2] == lang_code]
+        if lang_code == "custom":
+            matching_voices = [
+                (meta["display_name"], f"custom::{key}", meta.get("lang_code", "a"))
+                for key, meta in self.voice_registry.all_voices().items()
+            ]
+            if not matching_voices:
+                empty_label = ctk.CTkLabel(
+                    self.voice_list_frame,
+                    text="No custom voices yet.\nUse '+ Create New Voice' below to make one.",
+                    font=ctk.CTkFont(size=self._f(12)),
+                    text_color="gray60",
+                    justify="left",
+                )
+                empty_label.grid(row=0, column=0, padx=8, pady=8, sticky="w")
+                self.selected_voice_id = None
+                self.selected_lang_code = "a"
+                self.character_status_label.configure(text="No custom voices yet.")
+                return
+        else:
+            matching_voices = [v for v in VOICES if v[2] == lang_code]
+
         for i, (display_name, voice_id, vlang_code) in enumerate(matching_voices):
-            has_preview = os.path.exists(
-                os.path.join(CHARACTER_SPEECH_DIR, f"{voice_id}.wav")
-            )
+            is_custom_voice = voice_id.startswith("custom::")
+            if is_custom_voice:
+                key = voice_id.split("custom::", 1)[1]
+                has_preview = os.path.exists(os.path.join(CUSTOM_PREVIEW_DIR, f"{key}.wav"))
+            else:
+                has_preview = os.path.exists(
+                    os.path.join(CHARACTER_SPEECH_DIR, f"{voice_id}.wav")
+                )
             label_text = f"🔊 {display_name}" if has_preview else f"○ {display_name}"
+
+            # Wrap the select button (and, for custom voices, a delete
+            # button) in a per-row frame so the trash icon can sit alongside
+            # it without disturbing the select button's own click handler.
+            row = ctk.CTkFrame(self.voice_list_frame, fg_color="transparent")
+            row.grid(row=i, column=0, padx=4, pady=3, sticky="ew")
+            row.grid_columnconfigure(0, weight=1)
+
             btn = ctk.CTkButton(
-                self.voice_list_frame,
+                row,
                 text=label_text,
                 anchor="w",
                 height=self._f(38),
@@ -423,8 +620,23 @@ class CharacterVoiceStudio(ctk.CTk):
                     vid, lc, name
                 ),
             )
-            btn.grid(row=i, column=0, padx=4, pady=3, sticky="ew")
+            btn.grid(row=0, column=0, sticky="ew")
             self.voice_buttons[voice_id] = btn
+
+            if is_custom_voice:
+                del_btn = ctk.CTkButton(
+                    row,
+                    text="🗑",
+                    width=self._f(32),
+                    height=self._f(38),
+                    font=ctk.CTkFont(size=self._f(14)),
+                    fg_color="gray30",
+                    hover_color="#8B2C2C",
+                    command=lambda vid=voice_id, name=display_name: self._on_delete_custom_voice_clicked(
+                        vid, name
+                    ),
+                )
+                del_btn.grid(row=0, column=1, padx=(4, 0))
 
         # Auto-select the first voice in the newly shown language
         if matching_voices:
@@ -437,6 +649,11 @@ class CharacterVoiceStudio(ctk.CTk):
             )
 
     def _on_language_selected(self, label: str):
+        if label == "★ My Voices":
+            self.current_lang_code = "custom"
+            self.language_note_label.configure(text="")
+            self._populate_voice_list("custom")
+            return
         for lbl, code, note in LANGUAGES:
             if lbl == label:
                 self.current_lang_code = code
@@ -448,7 +665,7 @@ class CharacterVoiceStudio(ctk.CTk):
     def _build_text_panel(self):
         panel = ctk.CTkFrame(self, corner_radius=12)
         panel.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
-        panel.grid_rowconfigure(1, weight=1)
+        panel.grid_rowconfigure(2, weight=1)
         panel.grid_columnconfigure(0, weight=1)
 
         # -- Title row: title label + Help button side by side ------------
@@ -473,12 +690,33 @@ class CharacterVoiceStudio(ctk.CTk):
         )
         help_button.grid(row=0, column=1, sticky="e")
 
+        # -- Pause quick-insert button ----------------------------------
+        filler_row = ctk.CTkFrame(panel, fg_color="transparent")
+        filler_row.grid(row=1, column=0, padx=16, pady=(0, 4), sticky="w")
+
+        filler_label = ctk.CTkLabel(
+            filler_row, text="Insert:", font=ctk.CTkFont(size=self._f(12)), text_color="gray60"
+        )
+        filler_label.pack(side="left", padx=(0, 6))
+
+        pause_btn = ctk.CTkButton(
+            filler_row,
+            text="pause",
+            width=self._f(56),
+            height=self._f(24),
+            font=ctk.CTkFont(size=self._f(11)),
+            fg_color="gray30",
+            hover_color="gray20",
+            command=self._insert_pause_marker,
+        )
+        pause_btn.pack(side="left", padx=(0, 4))
+
         self.text_box = ctk.CTkTextbox(
             panel,
             font=ctk.CTkFont(size=self._f(15)),
             wrap="word",
         )
-        self.text_box.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="nsew")
+        self.text_box.grid(row=2, column=0, padx=16, pady=(0, 12), sticky="nsew")
         self.text_box.insert("1.0", self._load_last_text())
 
         # Auto-save the text box contents shortly after typing stops, and
@@ -487,7 +725,7 @@ class CharacterVoiceStudio(ctk.CTk):
         self.text_box.bind("<FocusOut>", lambda e: self._save_last_text())
 
         filename_row = ctk.CTkFrame(panel, fg_color="transparent")
-        filename_row.grid(row=2, column=0, padx=16, pady=(0, 8), sticky="ew")
+        filename_row.grid(row=3, column=0, padx=16, pady=(0, 8), sticky="ew")
         filename_row.grid_columnconfigure(0, weight=1)
 
         filename_label = ctk.CTkLabel(
@@ -504,7 +742,7 @@ class CharacterVoiceStudio(ctk.CTk):
         self.filename_entry.grid(row=1, column=0, sticky="ew", pady=(2, 0))
 
         controls = ctk.CTkFrame(panel, fg_color="transparent")
-        controls.grid(row=3, column=0, padx=16, pady=(0, 8), sticky="ew")
+        controls.grid(row=4, column=0, padx=16, pady=(0, 8), sticky="ew")
         controls.grid_columnconfigure(0, weight=1)
         controls.grid_columnconfigure(1, weight=0)
 
@@ -523,9 +761,28 @@ class CharacterVoiceStudio(ctk.CTk):
             command=lambda v: self.speed_value_label.configure(text=f"{v:.1f}x")
         )
 
+        # -- Emotion intensity slider (Chatterbox only) ----------------------
+        intensity_label = ctk.CTkLabel(
+            controls, text="Emotion intensity (Chatterbox only):",
+            font=ctk.CTkFont(size=self._f(13)),
+        )
+        intensity_label.grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+        self.intensity_slider = ctk.CTkSlider(controls, from_=0.1, to=1.5, number_of_steps=14)
+        self.intensity_slider.set(0.5)
+        self.intensity_slider.grid(row=3, column=0, sticky="ew", padx=(0, 12))
+
+        self.intensity_value_label = ctk.CTkLabel(
+            controls, text="0.50", font=ctk.CTkFont(size=self._f(13))
+        )
+        self.intensity_value_label.grid(row=3, column=1, sticky="e")
+        self.intensity_slider.configure(
+            command=lambda v: self.intensity_value_label.configure(text=f"{v:.2f}")
+        )
+
         # -- Emotion tag toggles --------------------------------------------
         emotions_frame = ctk.CTkFrame(panel, corner_radius=10)
-        emotions_frame.grid(row=4, column=0, padx=16, pady=(0, 8), sticky="ew")
+        emotions_frame.grid(row=5, column=0, padx=16, pady=(0, 8), sticky="ew")
         for col in range(3):
             emotions_frame.grid_columnconfigure(col, weight=1)
 
@@ -552,7 +809,7 @@ class CharacterVoiceStudio(ctk.CTk):
             self.emotion_switches[tag] = switch
 
         action_row = ctk.CTkFrame(panel, fg_color="transparent")
-        action_row.grid(row=5, column=0, padx=16, pady=(4, 8), sticky="ew")
+        action_row.grid(row=6, column=0, padx=16, pady=(4, 8), sticky="ew")
         action_row.grid_columnconfigure(0, weight=3)
         action_row.grid_columnconfigure(1, weight=1)
 
@@ -577,7 +834,7 @@ class CharacterVoiceStudio(ctk.CTk):
         self.stop_button.grid(row=0, column=1, sticky="ew")
 
         self.generate_progress = ctk.CTkProgressBar(panel, mode="indeterminate")
-        self.generate_progress.grid(row=6, column=0, padx=16, pady=(0, 8), sticky="ew")
+        self.generate_progress.grid(row=7, column=0, padx=16, pady=(0, 8), sticky="ew")
         self.generate_progress.set(0)
 
         self.output_status_label = ctk.CTkLabel(
@@ -588,7 +845,13 @@ class CharacterVoiceStudio(ctk.CTk):
             justify="left",
             anchor="w",
         )
-        self.output_status_label.grid(row=7, column=0, padx=16, pady=(0, 16), sticky="ew")
+        self.output_status_label.grid(row=8, column=0, padx=16, pady=(0, 16), sticky="ew")
+
+    def _insert_pause_marker(self):
+        # Inserts a default 0.5s pause - edit the number directly in the
+        # text box to change the duration, e.g. change to {pause:1.2}.
+        self.text_box.insert("insert", " {pause:0.5} ")
+        self.text_box.focus_set()
 
     # ------------------------------------------------------------------
     # Help dialog
@@ -633,6 +896,25 @@ class CharacterVoiceStudio(ctk.CTk):
             "\"Well, [chuckle] I suppose that's one way to do it.\""
         )
         add_section(
+            "Emotion intensity",
+            "The Emotion Intensity slider controls how strongly Chatterbox "
+            "leans into the emotional/expressive character of a tagged line. "
+            "Lower values stay closer to your reference voice; higher values "
+            "produce a bigger, more exaggerated reaction. Only affects lines "
+            "routed to Chatterbox - plain Kokoro narration is unaffected."
+        )
+        add_section(
+            "Pauses ({pause:N})",
+            "Type or insert \"{pause:N}\" to get an exact, controllable gap "
+            "of N seconds of real silence at that point - e.g. \"{pause:0.6}\" "
+            "for 600ms. This is genuine dead air, not something the TTS "
+            "engine has to guess from a comma, so it's the most reliable way "
+            "to control pacing. The Insert 'pause' button drops in "
+            "\"{pause:0.5}\" - just edit the number directly in the text box "
+            "to change the length. Pauses are capped at 10 seconds each so a "
+            "typo can't stall generation."
+        )
+        add_section(
             "Enabling / disabling tags",
             "Each tag has its own switch above the Generate button, ON by "
             "default. Turning a tag OFF strips that specific tag out of your "
@@ -654,8 +936,17 @@ class CharacterVoiceStudio(ctk.CTk):
             "\"Oh man, [laugh] that's such a good story.\"\n"
             "\"Sorry, excuse me, [cough] where was I?\"\n"
             "\"[sigh] Fine, I'll take care of it myself.\"\n"
+            "\"Okay, {pause:0.4} let me think about this. {pause:0.6} Alright.\"\n"
             "\"Wait, [shush] do you hear that? [gasp] Never mind, it's just "
             "the mailman.\""
+        )
+        add_section(
+            "Managing custom voices",
+            "Custom voices you create in '+ Create New Voice' show up under "
+            "the '★ My Voices' language entry. Each row there has a trash "
+            "icon next to it - click it and confirm to permanently delete "
+            "that voice, its saved preview clip, and its cached reference "
+            "audio."
         )
 
         close_btn = ctk.CTkButton(win, text="Close", command=win.destroy)
@@ -683,7 +974,15 @@ class CharacterVoiceStudio(ctk.CTk):
         self.selected_lang_code = lang_code
         self._highlight_selected_voice(voice_id)
 
-        sample_path = os.path.join(CHARACTER_SPEECH_DIR, f"{voice_id}.wav")
+        is_custom = voice_id.startswith("custom::")
+        custom_meta = None
+        if is_custom:
+            custom_key = voice_id.split("custom::", 1)[1]
+            custom_meta = self.voice_registry.get(custom_key)
+            os.makedirs(CUSTOM_PREVIEW_DIR, exist_ok=True)
+            sample_path = os.path.join(CUSTOM_PREVIEW_DIR, f"{custom_key}.wav")
+        else:
+            sample_path = os.path.join(CHARACTER_SPEECH_DIR, f"{voice_id}.wav")
 
         for btn in self.voice_buttons.values():
             btn.configure(state="disabled")
@@ -701,18 +1000,36 @@ class CharacterVoiceStudio(ctk.CTk):
                         self.character_status_label,
                         f"'{display_name}' selected.\nGenerating preview...",
                     )
-                    audio = self.engine.synthesize(
-                        PREVIEW_TEXTS.get(lang_code, "Hi there! This is a quick preview."),
-                        voice_id,
-                        lang_code,
-                    )
+                    if is_custom and custom_meta and custom_meta["type"] == "clone":
+                        audio = self.chatterbox_bridge.synthesize_chunk_with_reference(
+                            PREVIEW_TEXTS["a"],
+                            custom_meta["reference_path"],
+                            exaggeration=custom_meta.get("exaggeration", 0.5),
+                            seed=custom_meta.get("seed"),
+                            cfg_weight=custom_meta.get("cfg_weight", 0.5),
+                            temperature=custom_meta.get("temperature", 0.8),
+                        )
+                    elif is_custom and custom_meta and custom_meta["type"] == "mix":
+                        mix_lang = custom_meta.get("lang_code", "a")
+                        audio = self.engine.synthesize(
+                            PREVIEW_TEXTS.get(mix_lang, PREVIEW_TEXTS["a"]),
+                            custom_meta["voice_id"],
+                            mix_lang,
+                        )
+                    else:
+                        audio = self.engine.synthesize(
+                            PREVIEW_TEXTS.get(lang_code, "Hi there! This is a quick preview."),
+                            voice_id,
+                            lang_code,
+                        )
                     sf.write(sample_path, audio, SAMPLE_RATE)
-                    self.after(
-                        0,
-                        lambda: self.voice_buttons[voice_id].configure(
-                            text=f"🔊 {display_name}"
-                        ),
-                    )
+                    if not is_custom:
+                        self.after(
+                            0,
+                            lambda: self.voice_buttons[voice_id].configure(
+                                text=f"🔊 {display_name}"
+                            ),
+                        )
                     self._set_label(
                         self.character_status_label,
                         f"'{display_name}' selected.\nPreview saved and ready.",
@@ -727,18 +1044,120 @@ class CharacterVoiceStudio(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    
+    def _on_delete_custom_voice_clicked(self, voice_id: str, display_name: str):
+        """Shows a confirm dialog, then deletes the custom voice if the user
+        confirms. voice_id is the "custom::<key>" id used in self.voice_buttons."""
+        key = voice_id.split("custom::", 1)[1]
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Delete Voice")
+        dialog.geometry(f"{self._f(360)}x{self._f(170)}")
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        msg = ctk.CTkLabel(
+            dialog,
+            text=f"Delete '{display_name}'?\nThis removes the voice and its saved "
+                 f"audio, and can't be undone.",
+            font=ctk.CTkFont(size=self._f(13)),
+            wraplength=self._f(320),
+            justify="left",
+        )
+        msg.pack(padx=16, pady=(16, 12))
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(padx=16, pady=(0, 16), fill="x")
+        btn_row.grid_columnconfigure((0, 1), weight=1)
+
+        cancel_btn = ctk.CTkButton(
+            btn_row, text="Cancel", fg_color="gray30", hover_color="gray20",
+            command=dialog.destroy,
+        )
+        cancel_btn.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        def do_delete():
+            dialog.destroy()
+            self._delete_custom_voice(key, display_name)
+
+        confirm_btn = ctk.CTkButton(
+            btn_row, text="Delete", fg_color="#8B2C2C", hover_color="#6E2222",
+            command=do_delete,
+        )
+        confirm_btn.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+    def _delete_custom_voice(self, key: str, display_name: str):
+        """Removes a custom voice from the registry and cleans up any
+        cached audio (preview clip + Chatterbox reference clip) tied to it."""
+        try:
+            self.voice_registry.delete(key)
+        except AttributeError:
+            self._set_label(
+                self.character_status_label,
+                "Couldn't delete: VoiceRegistry has no delete() method yet.",
+            )
+            return
+        except Exception as e:
+            self._set_label(self.character_status_label, f"Error deleting voice: {e}")
+            return
+
+        preview_path = os.path.join(CUSTOM_PREVIEW_DIR, f"{key}.wav")
+        if os.path.exists(preview_path):
+            try:
+                os.remove(preview_path)
+            except Exception as e:
+                print(f"Could not remove preview file: {e}")
+
+        ref_path = self.chatterbox_bridge._reference_clip_path(key)
+        if os.path.exists(ref_path):
+            try:
+                os.remove(ref_path)
+            except Exception as e:
+                print(f"Could not remove reference clip: {e}")
+
+        # If the voice we just deleted was the selected one, clear that state
+        # so generation doesn't try to use a voice that no longer exists.
+        deleted_voice_id = f"custom::{key}"
+        if getattr(self, "selected_voice_id", None) == deleted_voice_id:
+            self.selected_voice_id = None
+
+        if self.current_lang_code == "custom":
+            self._populate_voice_list("custom")
+
+        self.character_status_label.configure(text=f"'{display_name}' deleted.")
+
     def _on_generate_clicked(self):
         text = self.text_box.get("1.0", "end").strip()
         if not text:
             self._set_label(self.output_status_label, "Please paste or type some text first.")
             return
 
+        voice_id = self.selected_voice_id
+        if not voice_id:
+            self._set_label(self.output_status_label, "Select or create a voice first.")
+            return
+
         self._save_last_text()
 
-        voice_id = self.selected_voice_id
         lang_code = self.selected_lang_code
         speed = float(self.speed_slider.get())
+        exaggeration = float(self.intensity_slider.get())
+
+        # Custom voices (from the "Create New Voice" panel) are prefixed
+        # "custom::<key>" - resolve what kind it is up front so the loop
+        # below knows how to route each group.
+        is_custom = voice_id.startswith("custom::")
+        custom_key = voice_id.split("custom::", 1)[1] if is_custom else None
+        custom_meta = self.voice_registry.get(custom_key) if is_custom else None
+        is_clone = bool(custom_meta and custom_meta.get("type") == "clone")
+        is_mix = bool(custom_meta and custom_meta.get("type") == "mix")
+        if is_mix:
+            lang_code = custom_meta.get("lang_code", lang_code)
+
+        # A cloned voice pins the seed you picked in the lab so its accent
+        # stays consistent between generations, plus its delivery knobs.
+        clone_seed = custom_meta.get("seed") if is_clone else None
+        clone_cfg = custom_meta.get("cfg_weight", 0.5) if is_clone else 0.5
+        clone_temp = custom_meta.get("temperature", 0.8) if is_clone else 0.8
 
         enabled_tags = {
             tag for tag, switch in self.emotion_switches.items() if switch.get() == 1
@@ -749,37 +1168,66 @@ class CharacterVoiceStudio(ctk.CTk):
 
         def worker():
             try:
-                sentences = split_into_chunks(text)
-                groups = group_chunks_by_engine(sentences, enabled_tags)
+                items = split_into_chunks(text)
+                groups = group_chunks_by_engine(items, enabled_tags)
                 if not groups:
                     raise RuntimeError("Nothing to generate.")
 
                 audio_segments = []
                 total = len(groups)
 
-                for i, (engine, group_text) in enumerate(groups, start=1):
-                    if engine == "chatterbox":
+                for i, group in enumerate(groups, start=1):
+                    engine = group["engine"]
+
+                    if engine == "pause":
+                        seconds = group["seconds"]
+                        self._set_label(
+                            self.output_status_label,
+                            f"Group {i}/{total}: inserting a {seconds:.2f}s pause...",
+                        )
+                        audio_segments.append(silence(seconds))
+                        continue
+
+                    if is_clone:
+                        # A cloned voice has no Kokoro identity to fall back
+                        # on - every line (tagged or not) goes through
+                        # Chatterbox using the imported reference recording.
+                        self._set_label(
+                            self.output_status_label,
+                            f"Group {i}/{total}: generating with your cloned voice...",
+                        )
+                        seg = self.chatterbox_bridge.synthesize_chunk_with_reference(
+                            group["text"], custom_meta["reference_path"],
+                            exaggeration=exaggeration, seed=clone_seed,
+                            cfg_weight=clone_cfg, temperature=clone_temp,
+                        )
+                    elif engine == "chatterbox":
                         self._set_label(
                             self.output_status_label,
                             f"Group {i}/{total}: generating with emotion (Chatterbox)...",
                         )
+                        synth_voice = custom_meta["voice_id"] if is_mix else voice_id
                         seg = self.chatterbox_bridge.synthesize_chunk(
-                            group_text, voice_id, lang_code
+                            group["text"], synth_voice, lang_code,
+                            exaggeration=exaggeration,
+                            reference_key=custom_key if is_mix else None,
                         )
                     else:
                         self._set_label(
                             self.output_status_label,
                             f"Group {i}/{total}: generating (Kokoro)...",
                         )
+                        synth_voice = custom_meta["voice_id"] if is_mix else voice_id
                         seg = self.engine.synthesize(
-                            group_text, voice_id, lang_code, speed=speed
+                            group["text"], synth_voice, lang_code, speed=speed
                         )
 
                     audio_segments.append(seg)
                     audio_segments.append(silence(0.12))  # shorter pause between groups
 
                 final_audio = np.concatenate(audio_segments)
-                out_path = self._build_output_path(voice_id)
+                out_path_label = custom_key if is_custom else voice_id
+                out_path = self._build_output_path(out_path_label)
                 sf.write(out_path, final_audio, SAMPLE_RATE)
                 duration = len(final_audio) / SAMPLE_RATE
 
@@ -882,35 +1330,66 @@ class CharacterVoiceStudio(ctk.CTk):
         self._save_last_text()
         self.destroy()
 
-def split_into_chunks(text: str):
-    """Splits text into sentence-level pieces. group_chunks_by_engine then
-    merges consecutive same-engine sentences back together, so this is just
-    the tokenizing step, not the final chunking."""
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-    chunks = []
-    for para in paragraphs:
-        sentences = re.split(r"(?<=[.!?])\s+", para)
-        for s in sentences:
-            s = s.strip()
-            if s:
-                chunks.append(s)
-    return chunks
 
-def group_chunks_by_engine(sentences, enabled_tags, max_chars=280):
-    """Groups consecutive sentences that use the same engine into single
-    generation calls, so prosody flows naturally within each group instead
-    of resetting every sentence. Still splits on engine changes or when a
-    group gets too long (Chatterbox degrades on very long single passes)."""
+def _split_sentences(text: str):
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def split_into_chunks(text: str):
+    """Tokenizes text into an ordered list of items:
+      {"type": "sentence", "text": "..."}     - normal narration
+      {"type": "pause", "seconds": 0.6}       - a {pause:N} marker
+
+    Markers are pulled out first so they survive as their own ordered token
+    instead of getting mangled by sentence splitting; group_chunks_by_engine
+    then decides what engine/audio each item maps to.
+    """
+    items = []
+    for para in text.split("\n"):
+        if not para.strip():
+            continue
+
+        pos = 0
+        for m in MARKER_RE.finditer(para):
+            before = para[pos:m.start()]
+            for s in _split_sentences(before):
+                items.append({"type": "sentence", "text": s})
+
+            seconds = max(0.0, min(float(m.group(1)), MAX_PAUSE_SECONDS))
+            items.append({"type": "pause", "seconds": seconds})
+
+            pos = m.end()
+
+        remainder = para[pos:]
+        for s in _split_sentences(remainder):
+            items.append({"type": "sentence", "text": s})
+
+    return items
+
+
+def group_chunks_by_engine(items, enabled_tags, max_chars=280):
+    """Groups consecutive same-engine sentence items into single generation
+    calls (so prosody flows naturally within each group). Still splits on
+    engine changes, on a {pause:N} marker, or when a group gets too long
+    (Chatterbox degrades on very long single passes)."""
     groups = []
     current_text = []
     current_engine = None
 
     def flush():
         if current_text:
-            groups.append((current_engine, " ".join(current_text)))
+            groups.append({"engine": current_engine, "text": " ".join(current_text)})
 
-    for sentence in sentences:
-        filtered = strip_disabled_tags(sentence, enabled_tags)
+    for item in items:
+        if item["type"] == "pause":
+            flush()
+            current_text = []
+            current_engine = None
+            groups.append({"engine": "pause", "seconds": item["seconds"]})
+            continue
+
+        filtered = strip_disabled_tags(item["text"], enabled_tags)
         if not filtered.strip():
             continue
 
@@ -927,6 +1406,7 @@ def group_chunks_by_engine(sentences, enabled_tags, max_chars=280):
     flush()
     return groups
 
+
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     if orig_sr == target_sr:
         return audio.astype(np.float32)
@@ -937,6 +1417,7 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
 
 def silence(duration_sec: float, sr: int = SAMPLE_RATE) -> np.ndarray:
     return np.zeros(int(duration_sec * sr), dtype=np.float32)
+
 
 if __name__ == "__main__":
     app = CharacterVoiceStudio()
