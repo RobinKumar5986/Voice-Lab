@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="legacy_logos3">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/kokoro-env/lib64/python3.12/site-packages/pygame/docs/generated/_static/legacy_logos.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

@@ -1,0 +1,10 @@
+<component name="libraryTable">
+  <library name="data">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/chatterbox-env/lib/python3.12/site-packages/pooch/tests/data/tiny-data.zip!/" />
+      <root url="jar://$PROJECT_DIR$/chatterbox-env/lib/python3.12/site-packages/pooch/tests/data/store.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>
