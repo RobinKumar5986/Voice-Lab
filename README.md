@@ -31,29 +31,15 @@ Built on [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) for fast narrat
 
 ## 🔊 Hear it in action
 
-All samples also live in the [`ExampleSoundFolder`](https://github.com/RobinKumar5986/Voice-Lab/tree/main/ExampleSoundFolder) — but you can press play right here.
+| Sample | What it demonstrates |
+|---|---|
+| [🔊 am_eric.wav](https://github.com/user-attachments/files/29946235/am_eric.wav) | A bundled male voice (Eric) |
+| [🔊 af_aoede.wav](https://github.com/user-attachments/files/29946237/af_aoede.wav) | A bundled female voice (Aoede) |
+| [🔊 mix_bella_x_Nicole.wav](https://github.com/user-attachments/files/29946233/mix_bella_x_Nicole.wav) | A **mixed** voice — Bella blended with Nicole |
+| [🔊 original_modi_ji_sound.mp3](https://github.com/user-attachments/files/29946231/original_modi_ji_sound.mp3) → [🔊 modi_ji.wav](https://github.com/user-attachments/files/29946232/modi_ji.wav) | A **cloned** voice — the second file is the clone generated from the first reference clip |
+| [🔊 Eric_Nicole_Talk.wav](https://github.com/user-attachments/files/29946234/Eric_Nicole_Talk.wav) | A full **multi-character conversation with emotion tags** |
 
-**A bundled male voice (Eric):**
-
-https://github.com/user-attachments/files/29946235/am_eric.wav
-
-**A bundled female voice (Aoede):**
-
-https://github.com/user-attachments/files/29946237/af_aoede.wav
-
-**A mixed voice — Bella blended with Nicole:**
-
-https://github.com/user-attachments/files/29946233/mix_bella_x_Nicole.wav
-
-**A cloned voice — original reference clip, then the clone generated from it:**
-
-https://github.com/user-attachments/files/29946231/original_modi_ji_sound.mp3
-
-https://github.com/user-attachments/files/29946232/modi_ji.wav
-
-**A full multi-character conversation with emotion tags:**
-
-https://github.com/user-attachments/files/29946234/Eric_Nicole_Talk.wav
+*(Click any filename above to download and listen — GitHub doesn't allow inline audio embeds from outside its own upload flow.)*
 
 The multi-character sample was generated from this exact prompt, with no editing after generation:
 
