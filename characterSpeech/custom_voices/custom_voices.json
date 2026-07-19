@@ -20,5 +20,11 @@
     "exaggeration": 0.40000000000000013,
     "cfg_weight": 0.6499999999999999,
     "temperature": 0.6
+  },
+  "sample_eric_sound": {
+    "display_name": "sample eric sound",
+    "type": "mix",
+    "lang_code": "a",
+    "voice_id": "am_eric(0.75),af_nicole(0.25)"
   }
 }
