@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CharacterVoiceStudio
+Comment=Kokoro / Chatterbox text-to-speech studio
+Exec="/home/robin/Desktop/Text to speech/launch.sh"
+Path=/home/robin/Desktop/Text to speech
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;
